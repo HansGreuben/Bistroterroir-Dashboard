@@ -135,12 +135,47 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
+    /* Ordermate: no public self-serve API for outside apps (only vetted BI
+       partners). Fallback ladder rung 3: the owner exports their Finance
+       Transaction Report from OfficeMate (filtered to State: ACTIVE, which
+       already excludes voided/deleted transactions) and drops it on the
+       Connections screen's upload panel. Every row starts with a
+       "DD/MM/YY H:MM AM/PM" Creation Time - counted per calendar day.
+       Verified against a real Bistro Terroir export, Aug 2026. */
+    configured: true,
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    mode: 'export',
+    async status(env, h) {
+      const to = new Date().toISOString().slice(0, 10);
+      const fromD = new Date(); fromD.setUTCDate(fromD.getUTCDate() - 60);
+      const r = await h.readIngested(fromD.toISOString().slice(0, 10), to);
+      return { connected: r.daysWithData > 0, org: 'Ordermate (uploaded reports)', sandbox: false, lastSync: r.lastDate };
+    },
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      if (!r.daysWithData) throw new Error('no Ordermate data uploaded for this period');
+      return { count: r.sums.count || 0 };
+    },
+    async fetchMonthly(env, h, q) {
+      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: m.months, count: m.byMonth.map((x) => (x ? (x.count || 0) : null)) };
+    },
+    /* Finance Transaction Report export -> one row per completed transaction,
+       counted per calendar day. Delimiter-agnostic: scans for the Creation
+       Time timestamp that starts every transaction row, so it works whether
+       the export is CSV, tab-separated, or pasted report text. */
+    parseExport(env, h, raw) {
+      const text = (raw && raw.text) || '';
+      const re = /(\d{2})\/(\d{2})\/(\d{2})\s+\d{1,2}:\d{2}\s*(AM|PM)/gi;
+      const counts = {};
+      let m;
+      while ((m = re.exec(text))) {
+        const date = '20' + m[3] + '-' + m[2] + '-' + m[1]; /* DD/MM/YY -> YYYY-MM-DD */
+        counts[date] = (counts[date] || 0) + 1;
+      }
+      return Object.entries(counts).map(([date, count]) => ({ date, count }));
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
