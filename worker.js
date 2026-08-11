@@ -642,14 +642,21 @@ function eachDate(from, to, cap) {
   return out;
 }
 
-/* Sum stored day rows across a range. Returns { sums, daysWithData, lastDate }. */
+/* Sum stored day rows across a range. Returns { sums, daysWithData, lastDate }.
+   Reads every day in the range in PARALLEL (Promise.all) rather than one at a
+   time - a 12-month trend touches ~365 KV keys, and doing those sequentially
+   made the dashboard hang for tens of seconds. Parallel reads stay well under
+   Workers KV's per-invocation subrequest ceiling and come back in roughly the
+   time of one round trip instead of the sum of all of them. */
 async function readIngested(env, source, from, to) {
+  const dates = eachDate(from, to);
+  const raws = await Promise.all(dates.map((date) => env.TOKENS.get('data:' + source + ':' + date)));
   const sums = {};
   let daysWithData = 0, lastDate = null;
-  for (const date of eachDate(from, to)) {
-    const raw = await env.TOKENS.get('data:' + source + ':' + date);
+  for (let i = 0; i < dates.length; i++) {
+    const raw = raws[i];
     if (!raw) continue;
-    daysWithData++; lastDate = date;
+    daysWithData++; lastDate = dates[i];
     try {
       const row = JSON.parse(raw);
       for (const [k, v] of Object.entries(row)) {
@@ -660,16 +667,16 @@ async function readIngested(env, source, from, to) {
   return { sums, daysWithData, lastDate };
 }
 
+/* Same parallelisation for the monthly trend: all months (each internally an
+   all-day-parallel readIngested) fire together instead of one month at a time. */
 async function monthlyIngested(env, source, fromMonth, toMonth) {
   const months = monthList(fromMonth, toMonth);
-  const out = { months, byMonth: [] };
-  for (const mo of months) {
+  const results = await Promise.all(months.map((mo) => {
     const [y, m] = mo.split('-').map(Number);
     const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const r = await readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
-    out.byMonth.push(r.daysWithData ? r.sums : null);
-  }
-  return out;
+    return readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
+  }));
+  return { months, byMonth: results.map((r) => (r.daysWithData ? r.sums : null)) };
 }
 
 /* POST /api/ingest?source=pos|accounting|rostering
