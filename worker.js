@@ -79,22 +79,46 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    /* MYOB Business (post-1-Sept-2026 OAuth flow). businessId/businessName
+       arrive on the OAuth redirect (not the token response) and are stashed
+       onto the token record in authCallback() below; myobPnL() reads them.
+       Verified against apisupport.myob.com's OAuth2.0 guide, Aug 2026. */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://secure.myob.com/oauth2/account/authorize',
+      tokenUrl: 'https://secure.myob.com/oauth2/v1/authorize',
+      scopes: 'sme-general-ledger',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'post',
+      /* prompt=consent is required by MYOB to return businessId on redirect. */
+      extraParams: { prompt: 'consent' }
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      if (!tokens.businessId) return { connected: false }; /* auth without a selected company file */
+      return { connected: true, org: tokens.businessName || null, sandbox: false, lastSync: tokens.obtained_at || null };
+    },
+    async fetchRange(env, h, q) { return await myobPnL(env, h, q.from, q.to); },
+    async fetchMonthly(env, h, q) {
+      const months = monthList(q.fromMonth, q.toMonth);
+      const out = { months, revenue: [], cogs: [], wagesSuper: [], overheads: [] };
+      for (const mo of months) {
+        const [y, m] = mo.split('-').map(Number);
+        const from = mo + '-01';
+        const to = mo + '-' + String(new Date(Date.UTC(y, m, 0)).getUTCDate()).padStart(2, '0');
+        try {
+          const r = await myobPnL(env, h, from, to);
+          out.revenue.push(r.revenue); out.cogs.push(r.cogs);
+          out.wagesSuper.push(r.wagesSuper); out.overheads.push(r.overheads);
+        } catch (e) {
+          out.revenue.push(null); out.cogs.push(null); out.wagesSuper.push(null); out.overheads.push(null);
+        }
+      }
+      return out;
+    }
   },
 
   /* >>> ADAPTER 2: POS
@@ -111,12 +135,51 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
+    /* Ordermate: no public self-serve API for outside apps (only vetted BI
+       partners). Fallback ladder rung 3: the owner exports their Finance
+       Transaction Report from OfficeMate (filtered to State: ACTIVE, which
+       already excludes voided/deleted transactions) and drops it on the
+       Connections screen's upload panel. Every row starts with a
+       "DD/MM/YY H:MM AM/PM" Creation Time - counted per calendar day.
+       Verified against a real Bistro Terroir export, Aug 2026. */
+    configured: true,
     auth: null,
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+    mode: 'export',
+    async status(env, h) {
+      const to = new Date().toISOString().slice(0, 10);
+      const fromD = new Date(); fromD.setUTCDate(fromD.getUTCDate() - 60);
+      const r = await h.readIngested(fromD.toISOString().slice(0, 10), to);
+      return { connected: r.daysWithData > 0, org: 'Ordermate (uploaded reports)', sandbox: false, lastSync: r.lastDate };
+    },
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      if (!r.daysWithData) throw new Error('no Ordermate data uploaded for this period');
+      return { count: r.sums.count || 0 };
+    },
+    async fetchMonthly(env, h, q) {
+      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: m.months, count: m.byMonth.map((x) => (x ? (x.count || 0) : null)) };
+    },
+    /* Finance Transaction Report export -> one row per completed transaction,
+       counted per calendar day. Delimiter-agnostic: scans for the Creation
+       Time timestamp that starts every transaction row (DD/MM/YYYY HH:MM:SS,
+       24-hour clock, confirmed against a real Bistro Terroir export, Aug
+       2026), then requires the state word right after it to read ACTIVE -
+       belt-and-braces against voided/refunded rows even though the owner's
+       export is already filtered to State: ACTIVE. */
+    parseExport(env, h, raw) {
+      const text = (raw && raw.text) || '';
+      const re = /(\d{2})\/(\d{2})\/(\d{4})\s+\d{2}:\d{2}:\d{2}\s+(\w+)/g;
+      const counts = {};
+      let m;
+      while ((m = re.exec(text))) {
+        if (m[4].toUpperCase() !== 'ACTIVE') continue;
+        const date = m[3] + '-' + m[2] + '-' + m[1]; /* DD/MM/YYYY -> YYYY-MM-DD */
+        counts[date] = (counts[date] || 0) + 1;
+      }
+      return Object.entries(counts).map(([date, count]) => ({ date, count }));
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -137,6 +200,66 @@ const ADAPTERS = {
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 };
+
+/* ----------------------------------------------------------------------------
+   MYOB accounting adapter helpers.
+
+   MYOB's ProfitAndLossSummary report requires StartDate/EndDate to fall
+   within a single financial year (1 Jul - 30 Jun in AU), so a requested range
+   spanning a FY boundary (e.g. a custom range, or "last financial year" vs
+   "this financial year" comparisons) is split into per-FY segments and summed.
+
+   The report returns a flat list of accounts (no section labels), so the
+   P&L section (Income / Cost of Sales / Expense) is inferred from the
+   leading digit of each account's DisplayID - the standard MYOB AU chart of
+   accounts numbering (4-xxxx Income, 5-xxxx Cost of Sales, 6/7/8/9-xxxx
+   Expense). Within the expense accounts, wage/super accounts are matched by
+   name keyword, per kpi-spec.md's "keyword + owner-confirm" method - the
+   fragile part, expected to be checked and tuned against the owner's actual
+   chart of accounts during reconciliation (Milestone 4 step 4).
+---------------------------------------------------------------------------- */
+function auFinancialYearSegments(from, to) {
+  const segments = [];
+  let curStart = from;
+  while (curStart <= to) {
+    const y = parseInt(curStart.slice(0, 4), 10);
+    const m = parseInt(curStart.slice(5, 7), 10);
+    const fyEndYear = m >= 7 ? y + 1 : y; /* FY runs Jul Y -> Jun Y+1 */
+    const fyEnd = fyEndYear + '-06-30';
+    const segEnd = fyEnd < to ? fyEnd : to;
+    segments.push({ from: curStart, to: segEnd });
+    const d = new Date(segEnd + 'T00:00:00Z');
+    d.setUTCDate(d.getUTCDate() + 1);
+    curStart = d.toISOString().slice(0, 10);
+  }
+  return segments;
+}
+const WAGE_SUPER_RE = /wage|salary|salaries|super/i;
+async function myobPnL(env, h, from, to) {
+  const tokens = await h.getTokens();
+  if (!tokens || !tokens.businessId) { const e = new Error('no MYOB company file selected'); e.status = 401; throw e; }
+  const cfUri = 'https://api.myob.com/accountright/' + tokens.businessId;
+  const totals = { revenue: 0, cogs: 0, wagesSuper: 0, overheads: 0 };
+  for (const seg of auFinancialYearSegments(from, to)) {
+    const url = cfUri + '/Report/ProfitAndLossSummary?StartDate=' + seg.from
+      + '&EndDate=' + seg.to + '&ReportingBasis=Accrual&YearEndAdjust=false';
+    const data = await h.fetchJson(url, {}, {});
+    const rows = data.AccountsBreakdown || [];
+    for (const row of rows) {
+      const acct = row.Account || {};
+      const amt = Number(row.AccountTotal) || 0;
+      const digit = String(acct.DisplayID || '').charAt(0);
+      const name = String(acct.Name || '');
+      if (digit === '4') totals.revenue += amt;
+      else if (digit === '5') totals.cogs += amt;
+      else if ('6789'.includes(digit)) {
+        if (WAGE_SUPER_RE.test(name)) totals.wagesSuper += amt;
+        else totals.overheads += amt;
+      }
+    }
+  }
+  return totals;
+}
 
 /* ============================================================================
    Everything below is the shell. You should rarely need to edit it.
@@ -451,6 +574,7 @@ async function authStart(env, source, url) {
     scope: cfg.scopes || '',
     state
   });
+  if (cfg.extraParams) { for (const k in cfg.extraParams) p.set(k, cfg.extraParams[k]); }
   return Response.redirect(cfg.authorizeUrl + '?' + p.toString(), 302);
 }
 
@@ -479,7 +603,12 @@ async function authCallback(env, source, url) {
     refresh_token: t.refresh_token || null,
     token_type: t.token_type || 'Bearer',
     expires_at: Date.now() + ((t.expires_in || 1800) * 1000),
-    obtained_at: new Date().toISOString()
+    obtained_at: new Date().toISOString(),
+    /* MYOB-specific: the selected company file's GUID + display name arrive
+       on the redirect itself (not the token response). Harmless no-ops for
+       other providers. */
+    businessId: url.searchParams.get('businessId') || null,
+    businessName: url.searchParams.get('businessName') || null
   });
   /* After token storage, adapters' status() should resolve org name etc. */
   return Response.redirect(url.origin + '/', 302);
@@ -517,14 +646,21 @@ function eachDate(from, to, cap) {
   return out;
 }
 
-/* Sum stored day rows across a range. Returns { sums, daysWithData, lastDate }. */
+/* Sum stored day rows across a range. Returns { sums, daysWithData, lastDate }.
+   Reads every day in the range in PARALLEL (Promise.all) rather than one at a
+   time - a 12-month trend touches ~365 KV keys, and doing those sequentially
+   made the dashboard hang for tens of seconds. Parallel reads stay well under
+   Workers KV's per-invocation subrequest ceiling and come back in roughly the
+   time of one round trip instead of the sum of all of them. */
 async function readIngested(env, source, from, to) {
+  const dates = eachDate(from, to);
+  const raws = await Promise.all(dates.map((date) => env.TOKENS.get('data:' + source + ':' + date)));
   const sums = {};
   let daysWithData = 0, lastDate = null;
-  for (const date of eachDate(from, to)) {
-    const raw = await env.TOKENS.get('data:' + source + ':' + date);
+  for (let i = 0; i < dates.length; i++) {
+    const raw = raws[i];
     if (!raw) continue;
-    daysWithData++; lastDate = date;
+    daysWithData++; lastDate = dates[i];
     try {
       const row = JSON.parse(raw);
       for (const [k, v] of Object.entries(row)) {
@@ -535,16 +671,16 @@ async function readIngested(env, source, from, to) {
   return { sums, daysWithData, lastDate };
 }
 
+/* Same parallelisation for the monthly trend: all months (each internally an
+   all-day-parallel readIngested) fire together instead of one month at a time. */
 async function monthlyIngested(env, source, fromMonth, toMonth) {
   const months = monthList(fromMonth, toMonth);
-  const out = { months, byMonth: [] };
-  for (const mo of months) {
+  const results = await Promise.all(months.map((mo) => {
     const [y, m] = mo.split('-').map(Number);
     const lastDay = new Date(Date.UTC(y, m, 0)).getUTCDate();
-    const r = await readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
-    out.byMonth.push(r.daysWithData ? r.sums : null);
-  }
-  return out;
+    return readIngested(env, source, mo + '-01', mo + '-' + String(lastDay).padStart(2, '0'));
+  }));
+  return { months, byMonth: results.map((r) => (r.daysWithData ? r.sums : null)) };
 }
 
 /* POST /api/ingest?source=pos|accounting|rostering
