@@ -1,5 +1,5 @@
 {
-  "name": "bistroterroir-dashboard",
+  "name": "bistroterroir-venue-dashboard",
   "private": true,
   "scripts": {
     "dev": "wrangler dev",

@@ -5,10 +5,9 @@
 # the owner's Cloudflare yourself). The owner never edits this file.
 # ============================================================================
 
-name = "bistroterroir-venue-dashboard"        # SET to the GitHub REPO name
+name = "bistroterroir-venue-dashboard"          # SET to the GitHub REPO name
 main = "worker.js"
 compatibility_date = "2026-06-01"
-# build trigger
 
 # The dashboard page is bundled into the Worker as text.
 rules = [
