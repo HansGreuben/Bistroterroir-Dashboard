@@ -1,4 +1,4 @@
-/* ============================================================================
+’/* ============================================================================
    Venue dashboard - Worker shell (ships in the FC Member Dashboard Kit)
 
    You are the AI running this build. This file is YOURS to finish; the owner
