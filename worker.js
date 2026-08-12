@@ -182,6 +182,78 @@ const ADAPTERS = {
     }
   },
 
+  /* >>> ADAPTER: RESERVATIONS (owner add-on, not part of the locked kpi-spec.md
+     seven metrics - built as an additional, clearly-labelled extra, per
+     kpi-spec.md's own rule that extra numbers must never be folded into the
+     locked definitions). SevenRooms: live API needs a partnership application
+     (developers.sevenrooms.com, gated as of Aug 2026), so this uses the same
+     fallback-ladder guided-upload rung as Ordermate - the owner exports their
+     reservations report from SevenRooms and drops it on the Connections
+     screen. Confirmed against a real Bistro Terroir SevenRooms export, Aug
+     2026: tab-separated, header row present, "Reservation Date" already in
+     YYYY-MM-DD, "Booked Covers" a plain integer. Copy-pasted exports (e.g. via
+     Remote Desktop clipboard, as the owner's OfficeMate exports also are) can
+     pick up a stray leading row-number column that isn't in the header - the
+     parser below detects and skips that automatically. */
+  reservations: {
+    configured: true,
+    auth: null,
+    oauth: {},
+    mode: 'export',
+    async status(env, h) {
+      const to = new Date().toISOString().slice(0, 10);
+      const fromD = new Date(); fromD.setUTCDate(fromD.getUTCDate() - 60);
+      const r = await h.readIngested(fromD.toISOString().slice(0, 10), to);
+      return { connected: r.daysWithData > 0, org: 'SevenRooms (uploaded reports)', sandbox: false, lastSync: r.lastDate };
+    },
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      if (!r.daysWithData) throw new Error('no SevenRooms data uploaded for this period');
+      return { reservations: r.sums.reservations || 0, covers: r.sums.covers || 0 };
+    },
+    async fetchMonthly(env, h, q) {
+      const m = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return {
+        months: m.months,
+        reservations: m.byMonth.map((x) => (x ? (x.reservations || 0) : null)),
+        covers: m.byMonth.map((x) => (x ? (x.covers || 0) : null))
+      };
+    },
+    /* Header-driven so column order never breaks it: finds "Reservation
+       Date" and "Booked Covers" by name, then per row checks whether a
+       stray leading column (e.g. a spreadsheet row number, picked up by a
+       copy-paste export) shifted everything right by one - by testing
+       whether a clean YYYY-MM-DD actually sits at the expected position.
+       Deliberately NOT based on comparing row length to header length:
+       trailing blank columns can get trimmed by an editor along the way,
+       which made total-length comparison unreliable in testing against a
+       real export. Counts one reservation + its covers per valid dated row. */
+    parseExport(env, h, raw) {
+      const text = (raw && raw.text) || '';
+      const lines = text.split(/\r\n|\r|\n/).filter((l) => l.trim().length);
+      if (!lines.length) return [];
+      const delim = lines[0].indexOf('\t') >= 0 ? '\t' : ',';
+      const header = lines[0].split(delim).map((h) => h.trim());
+      const dateIdx = header.indexOf('Reservation Date');
+      const coversIdx = header.indexOf('Booked Covers');
+      if (dateIdx < 0 || coversIdx < 0) return [];
+      const dateRe = /^\d{4}-\d{2}-\d{2}$/;
+      const byDate = {};
+      for (let i = 1; i < lines.length; i++) {
+        const row = lines[i].split(delim);
+        let offset = 0;
+        if (!dateRe.test((row[dateIdx] || '').trim()) && dateRe.test((row[dateIdx + 1] || '').trim())) offset = 1;
+        const dateVal = (row[dateIdx + offset] || '').trim();
+        if (!dateRe.test(dateVal)) continue;
+        const covers = Number((row[coversIdx + offset] || '').trim()) || 0;
+        if (!byDate[dateVal]) byDate[dateVal] = { reservations: 0, covers: 0 };
+        byDate[dateVal].reservations += 1;
+        byDate[dateVal].covers += covers;
+      }
+      return Object.entries(byDate).map(([date, v]) => ({ date, reservations: v.reservations, covers: v.covers }));
+    }
+  },
+
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
      Contract:
        status(env, h)        -> { connected, org, sandbox, lastSync }
@@ -683,12 +755,12 @@ async function monthlyIngested(env, source, fromMonth, toMonth) {
   return { months, byMonth: results.map((r) => (r.daysWithData ? r.sums : null)) };
 }
 
-/* POST /api/ingest?source=pos|accounting|rostering
+/* POST /api/ingest?source=pos|accounting|rostering|reservations
    Authorization: Bearer <INGEST_TOKEN>. Body: the exported file's text.
    The source's adapter.parseExport() turns it into day rows. */
 async function apiIngest(env, request, url) {
   const source = url.searchParams.get('source');
-  if (!['accounting', 'pos', 'rostering'].includes(source)) return json({ error: 'unknown source' }, 400);
+  if (!['accounting', 'pos', 'rostering', 'reservations'].includes(source)) return json({ error: 'unknown source' }, 400);
   const auth = request.headers.get('Authorization') || '';
   if (!env.INGEST_TOKEN || auth !== 'Bearer ' + env.INGEST_TOKEN) {
     return json({ error: 'not authorised', plain: 'That upload code didn\u2019t match. Check it with your AI and try again.' }, 401);
@@ -756,7 +828,7 @@ async function sourceStatus(env, source) {
 async function fetchSlot(env, q) {
   /* One period slot: pull each configured source; null where unavailable. */
   const out = {};
-  for (const source of ['accounting', 'pos', 'rostering']) {
+  for (const source of ['accounting', 'pos', 'rostering', 'reservations']) {
     const adapter = ADAPTERS[source];
     if (!adapter || !adapter.configured) { out[source] = null; continue; }
     try {
@@ -782,10 +854,11 @@ async function apiMetrics(env, url) {
   const rollover = Math.max(0, Math.min(6, parseInt(url.searchParams.get('rollover') || '0', 10) || 0));
 
   const base = { tz, rollover };
-  const [sAcc, sPos, sRos] = await Promise.all([
+  const [sAcc, sPos, sRos, sResv] = await Promise.all([
     sourceStatus(env, 'accounting'),
     sourceStatus(env, 'pos'),
-    sourceStatus(env, 'rostering')
+    sourceStatus(env, 'rostering'),
+    sourceStatus(env, 'reservations')
   ]);
 
   /* The provider calls (periods + trend) are the expensive part and the only
@@ -813,7 +886,7 @@ async function apiMetrics(env, url) {
     let trendOut = null;
     if (trend) {
       trendOut = { months: monthList(trend.fromMonth, trend.toMonth) };
-      for (const source of ['accounting', 'pos']) {
+      for (const source of ['accounting', 'pos', 'reservations']) {
         const adapter = ADAPTERS[source];
         if (!adapter || !adapter.configured) { trendOut[source] = null; continue; }
         try {
@@ -832,7 +905,7 @@ async function apiMetrics(env, url) {
   return json({
     generatedAt: data.generatedAt,
     protected: true,
-    sources: { accounting: sAcc, pos: sPos, rostering: sRos },
+    sources: { accounting: sAcc, pos: sPos, rostering: sRos, reservations: sResv },
     periods: data.periods,
     trend: data.trend
   });
@@ -900,7 +973,7 @@ export default {
     if (path === '/api/disconnect' && request.method === 'POST') {
       if (!loggedIn) return json({ error: 'auth' }, 401);
       const source = url.searchParams.get('source');
-      if (['accounting', 'pos', 'rostering'].includes(source)) {
+      if (['accounting', 'pos', 'rostering', 'reservations'].includes(source)) {
         await clearTokens(env, source);
         return json({ ok: true });
       }
@@ -912,7 +985,7 @@ export default {
   /* Cron rung: uncomment [triggers] in wrangler.toml and give any adapter a
      scheduledPull() to fetch its tool's own export on a schedule. */
   async scheduled(event, env, ctx) {
-    for (const source of ['accounting', 'pos', 'rostering']) {
+    for (const source of ['accounting', 'pos', 'rostering', 'reservations']) {
       const a = ADAPTERS[source];
       if (a && typeof a.scheduledPull === 'function') {
         try {
