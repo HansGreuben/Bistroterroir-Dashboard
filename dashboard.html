@@ -366,15 +366,27 @@ var METRIC_DEFS = {
                   decision: 'Fixed costs drifting up? Review subscriptions, utilities and new recurring spend.' },
   profit:       { label: 'Profit', fmt: 'money', dual: true, needs: ['accounting'], goodDir: 'up',
                   def: 'Revenue less cost of sales, wages, super and overheads · from ' + P.accounting,
-                  decision: 'What the venue keeps after the costs you control. The bottom line of the board.' }
+                  decision: 'What the venue keeps after the costs you control. The bottom line of the board.' },
+
+  /* Owner add-on, outside the locked kpi-spec.md seven - kept out of CHOSEN
+     and shown in its own clearly-labelled "Extra" section instead, per
+     kpi-spec.md's rule that extras never fold into the locked definitions. */
+  reservations: { label: 'Reservations booked', fmt: 'int', needs: ['reservations'], goodDir: 'up',
+                  def: 'Count of bookings for the period · from SevenRooms',
+                  decision: 'How much of the coming trade is already locked in.' },
+  covers:       { label: 'Covers booked', fmt: 'int', needs: ['reservations'], goodDir: 'up',
+                  def: 'Total guests across all bookings for the period · from SevenRooms',
+                  decision: 'What kitchen and floor should be prepped for, ahead of service.' }
 };
 var CHOSEN = KIT_CONFIG.metrics.filter(function (k) { return METRIC_DEFS[k]; });
+var EXTRAS = ['reservations', 'covers'].filter(function (k) { return METRIC_DEFS[k]; });
 
 var SOURCES = [
   { key: 'accounting', name: P.accounting, role: 'Money figures (' + KIT_CONFIG.taxLabel + ')' },
   { key: 'pos',        name: P.pos,        role: 'Transaction count' }
 ];
 if (P.rostering) SOURCES.push({ key: 'rostering', name: P.rostering, role: 'Projected wages (optional)' });
+SOURCES.push({ key: 'reservations', name: 'SevenRooms', role: 'Reservations & covers (extra)' });
 
 /* ============================================================
    Dates and periods - venue timezone, week start, rollover.
@@ -586,6 +598,7 @@ function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
   var acc = p.accounting || null;
   var pos = p.pos || null;
   var ros = p.rostering || null;
+  var resv = p.reservations || null;
   var out = {};
   if (acc) {
     out.revenue = num(acc.revenue);
@@ -595,6 +608,7 @@ function periodValues(slot) {  /* slot: 'cur' | 'prev' | 'yoy' */
   }
   if (pos) out.count = num(pos.count);
   if (ros) out.rosteredCost = num(ros.cost);
+  if (resv) { out.reservations = num(resv.reservations); out.covers = num(resv.covers); }
   return out;
 }
 function num(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
@@ -648,6 +662,8 @@ function metricValue(key, vals) {
     if (vals.count === 0) return 'dash';
     return vals.revenue / vals.count;
   }
+  if (key === 'reservations') return vals.reservations;
+  if (key === 'covers') return vals.covers;
   return null;
 }
 
@@ -886,6 +902,19 @@ function renderDashboard(root) {
   var cur = periodValues('cur'), prev = periodValues('prev'), yoy = periodValues('yoy');
   CHOSEN.forEach(function (k) { grid.appendChild(metricCard(k, cur, prev, yoy, r)); });
   root.appendChild(grid);
+
+  /* Extras: owner add-ons outside the locked kpi-spec.md metrics, kept in
+     their own clearly-labelled section so they're never mistaken for one of
+     the core seven. */
+  if (EXTRAS.length && !isManual()) {
+    var exHead = el('div', 'period-heading');
+    exHead.style.marginTop = '1.75rem';
+    exHead.innerHTML = 'Extra · added for this venue';
+    root.appendChild(exHead);
+    var exGrid = el('div', 'cards');
+    EXTRAS.forEach(function (k) { exGrid.appendChild(metricCard(k, cur, prev, yoy, r)); });
+    root.appendChild(exGrid);
+  }
 }
 
 function periodLabel() {
